@@ -345,6 +345,32 @@ async function salvarSupabase() {
   }
 }
 
+// Auto-save por linha com debounce de 1.5s
+const _debTimers = {};
+function agendarSalvarLinha(mesKey, dia) {
+  const key = `${mesKey}-${dia}`;
+  clearTimeout(_debTimers[key]);
+  mostrarStatus('✏️ Salvando...', 0);
+  _debTimers[key] = setTimeout(() => salvarLinha(mesKey, +dia), 1500);
+}
+
+async function salvarLinha(mesKey, dia) {
+  const v = getDia(mesKey, +dia);
+  try {
+    const { error } = await supa.from('producao').upsert(
+      [{ mes_key: mesKey, dia: +dia, u: v.u, r: v.r, p: v.p, cg: v.cg, rc: v.rc,
+         updated_at: new Date().toISOString() }],
+      { onConflict: 'mes_key,dia' }
+    );
+    if (error) throw error;
+    salvarLocal();
+    mostrarStatus('✅ Salvo!', 2000);
+  } catch(e) {
+    mostrarStatus('⚠️ Falha ao salvar. Dados em cache local.', 5000);
+    console.warn('Auto-save falhou:', e.message);
+  }
+}
+
 function getDia(mesKey, dia) {
   return bd[mesKey]?.[dia] || {u:null,r:null,p:null,cg:null,rc:null};
 }
@@ -356,7 +382,7 @@ function setDia(mesKey, dia, campo, val) {
 }
 
 // ── SELEÇÃO DE MESES ──────────────────────────────────
-let mesesAtivos = new Set([10]); // outubro ativo por padrão
+let mesesAtivos = new Set([new Date().getMonth() + 1]); // mês atual por padrão
 
 function diasDoMes(mes) { // mes = 1-12
   return new Date(ANO, mes, 0).getDate();
@@ -587,6 +613,7 @@ document.getElementById('meses-container').addEventListener('input', e => {
   const {mk, d, c} = e.target.dataset;
   const val = e.target.value==='' ? null : +e.target.value;
   setDia(mk, +d, c, val);
+  agendarSalvarLinha(mk, +d);
   atualizarChip(+mk.split('-')[1]);
 
   // Atualizar células calculadas da linha
@@ -766,6 +793,34 @@ document.getElementById('print-modal').addEventListener('click', e => {
   if (e.target === document.getElementById('print-modal')) fecharPrint();
 });
 
+// ── REALTIME ─────────────────────────────────────────
+function aplicarRowRemoto(row) {
+  if (!bd[row.mes_key]) bd[row.mes_key] = {};
+  bd[row.mes_key][row.dia] = { u: row.u, r: row.r, p: row.p, cg: row.cg, rc: row.rc };
+  salvarLocal();
+  const mes = +row.mes_key.split('-')[1];
+  atualizarChip(mes);
+  if (!mesesAtivos.has(mes)) return;
+  // Atualizar inputs da linha (somente se não estiver em foco)
+  document.querySelectorAll(`[data-mk="${row.mes_key}"][data-d="${row.dia}"]`).forEach(inp => {
+    if (document.activeElement === inp) return;
+    const val = row[inp.dataset.c];
+    inp.value = (val !== null && val !== undefined) ? val : '';
+  });
+  // Atualizar células calculadas da linha
+  const tid = `tbl-${row.mes_key}`;
+  const v = getDia(row.mes_key, row.dia);
+  const temP = v.u!==null||v.r!==null;
+  const totD = temP?(v.u||0)+(v.r||0):null;
+  const ppp  = temP&&v.p?Math.round(totD/v.p):null;
+  const gEl  = document.getElementById(`${tid}-g-${row.dia}`);
+  const pEl  = document.getElementById(`${tid}-ppp-${row.dia}`);
+  if(gEl){gEl.textContent=totD!==null?totD.toLocaleString('pt-BR'):'—';gEl.className='td-r'+(totD===null?' dim':'');}
+  if(pEl){pEl.textContent=ppp!==null?ppp.toLocaleString('pt-BR'):'—';pEl.className='td-c '+(ppp!==null?'ok':'dim');}
+  recalcularMes(row.mes_key);
+  recalcularConsolidado();
+}
+
 // ── INIT ─────────────────────────────────────────────
 (async () => {
   const hoje = new Date();
@@ -775,6 +830,15 @@ document.getElementById('print-modal').addEventListener('click', e => {
     '<div class="vazio-msg">⏳ Carregando dados...</div>';
   bd = await carregarSupabase();
   renderTudo();
+
+  // Assinatura Realtime — atualiza todos os clientes conectados
+  supa.channel('producao-sync')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'producao' }, p => aplicarRowRemoto(p.new))
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'producao' }, p => aplicarRowRemoto(p.new))
+    .subscribe(status => {
+      if (status === 'SUBSCRIBED') mostrarStatus('🟢 Sincronização ativa', 3000);
+      if (status === 'CHANNEL_ERROR') mostrarStatus('⚠️ Erro de sincronização em tempo real', 5000);
+    });
 })();
 </script>
 </body>
